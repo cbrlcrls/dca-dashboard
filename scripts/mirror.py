@@ -31,7 +31,7 @@ import re
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
 from pathlib import Path
 
 try:
@@ -80,6 +80,31 @@ MIN_DATA_ROWS = 15            # the Sheet currently has 21; fewer than 15 means 
 REQUIRED_TICKERS = {"SPY", "VIX", "HYG"}
 SECTION_RE = re.compile(r"^\d+\.\s")   # "1. Core equity market indicators"
 NULL_VALUES = {"", "n/a", "na", "#n/a"}
+
+SCHEMA_VERSION = "2.0"
+SOURCE_TIMEZONE = "America/Los_Angeles"   # the Google Sheet's time zone
+MARKET_TIMEZONE = "America/New_York"
+MAX_QUOTE_AGE_MIN = 30                    # flag older quotes while the market is open
+MAX_CBOE_QUOTE_AGE_MIN = 60               # Cboe index quotes (VIX, VIX3M, TNX) update less often in Google Finance
+MAX_TREND_AGE_MIN = 30                    # flag older trend copies while the market is open
+
+# NYSE full-day holidays and 1:00 pm early closes (source: nyse.com Holidays & Trading Hours).
+# Add the next year's dates each December.
+NYSE_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+NYSE_EARLY_CLOSES = {"2026-11-27", "2026-12-24", "2027-11-26"}
+LOCAL_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+
+def zone(name):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------- fetch
@@ -136,6 +161,7 @@ def parse(text: str) -> dict:
         raise SystemExit("Downloaded CSV is empty. Not publishing.")
 
     title, last_updated, last_updated_note, units_note = "DCA Decision Dashboard", None, None, None
+    trend_as_of = None
     header_index = None
 
     for i, row in enumerate(rows):
@@ -146,6 +172,8 @@ def parse(text: str) -> dict:
         elif norm(first) == "last updated":
             last_updated = cells[1] if len(cells) > 1 else None
             last_updated_note = cells[2] if len(cells) > 2 and cells[2] else None
+            if len(cells) > 4 and norm(cells[3]) == "trend values copied":
+                trend_as_of = cells[4] or None
         elif first.lower().startswith("units:"):
             units_note = first
         elif norm(first) == "ticker":
@@ -194,6 +222,7 @@ def parse(text: str) -> dict:
         "title": title,
         "last_updated": last_updated,
         "last_updated_note": last_updated_note,
+        "trend_as_of": trend_as_of,
         "units_note": units_note,
         "sections": sections,
         "records": records,
@@ -204,8 +233,7 @@ def parse(text: str) -> dict:
 
 # ----------------------------------------------------------------------------- write
 
-def mirror_times():
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+def mirror_times(now):
     utc_iso = now.isoformat().replace("+00:00", "Z")
     utc_text = now.strftime("%Y-%m-%d %H:%M UTC")
     if PACIFIC:
@@ -225,19 +253,114 @@ def write_clean_csv(data: dict, path: Path):
     path.write_text(buf.getvalue(), encoding="utf-8")
 
 
-def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str):
+def iso_utc(dt):
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z") if dt else None
+
+
+def local_to_utc(text, tz_name):
+    """'2026-11-24 15:55' in the given zone -> aware UTC datetime, or None."""
+    tz = zone(tz_name)
+    if not tz or not isinstance(text, str) or not LOCAL_TIME_RE.match(text.strip()):
+        return None
+    return datetime.strptime(text.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(timezone.utc)
+
+
+def market_session(now_utc):
+    """Session of the US stock market at now_utc, using the NYSE calendar above."""
+    tz = zone(MARKET_TIMEZONE)
+    if not tz:
+        return "unknown", False
+    ny = now_utc.astimezone(tz)
+    day = ny.date().isoformat()
+    early = day in NYSE_EARLY_CLOSES
+    if ny.weekday() >= 5:
+        return "weekend", False
+    if day in NYSE_HOLIDAYS:
+        return "holiday", False
+    close = dtime(13, 0) if early else dtime(16, 0)
+    t = ny.time()
+    if t < dtime(4, 0):
+        return "closed", early
+    if t < dtime(9, 30):
+        return "premarket", early
+    if t < close:
+        return "open", early
+    if t < dtime(20, 0):
+        return "after_hours", early
+    return "closed", early
+
+
+def quote_zone(data_symbol):
+    """Exchange time zone of a row's last trade time, or None for calculated/daily rows."""
+    if not isinstance(data_symbol, str) or ":" not in data_symbol:
+        return None
+    return "America/Chicago" if data_symbol.upper().startswith("INDEXCBOE:") else MARKET_TIMEZONE
+
+
+def is_num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def quality_flags(rows, session, now_utc, trend_utc):
+    flags = []
+    for r in rows:
+        t = r.get("ticker")
+        status = r.get("status")
+        if isinstance(status, str) and not status.upper().startswith("OK"):
+            flags.append({"ticker": t, "issue": f"Status is {status}"})
+        if quote_zone(r.get("data_symbol")) and r.get("quote_timestamp_utc") is None:
+            flags.append({"ticker": t, "issue": "No trade timestamp in the published data, so quote freshness cannot be verified"})
+        age = r.get("quote_age_min")
+        limit = MAX_CBOE_QUOTE_AGE_MIN if quote_zone(r.get("data_symbol")) == "America/Chicago" else MAX_QUOTE_AGE_MIN
+        if session == "open" and is_num(age) and age > limit:
+            flags.append({"ticker": t, "issue": f"Quote is {age} minutes old during market hours"})
+        p, pc, dc, pct = r.get("price"), r.get("previous_close"), r.get("day_change"), r.get("day_change_pct")
+        if is_num(p) and is_num(pc) and is_num(dc) and abs(p - pc - dc) > max(0.011, abs(p) * 0.0001):
+            flags.append({"ticker": t, "issue": f"Day change {dc} does not match price {p} minus previous close {pc}"})
+        if is_num(p) and is_num(pc) and is_num(pct) and pc != 0 and abs((p / pc - 1) * 100 - pct) > 0.02:
+            flags.append({"ticker": t, "issue": f"Day change % {pct} does not match price and previous close"})
+    if trend_utc is None:
+        flags.append({"ticker": None, "issue": "Trend copy time unavailable, so trend columns may be stale"})
+    elif session == "open":
+        trend_age = int((now_utc - trend_utc).total_seconds() // 60)
+        if trend_age > MAX_TREND_AGE_MIN:
+            flags.append({"ticker": None, "issue": f"Trend values were copied {trend_age} minutes ago during market hours"})
+    return flags
+
+
+def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str, now_utc=None):
     rows = []
     for r in data["records"]:
         obj = {"section": r["section"]}
         for key, value in zip(data["keys"], r["cells"]):
             obj[key] = to_json_value(key, value)
+        qz = quote_zone(obj.get("data_symbol"))
+        qt = local_to_utc(obj.get("last_trade_time"), qz) if qz else None
+        obj["quote_timestamp_utc"] = iso_utc(qt)
+        obj["quote_age_min"] = max(0, int((now_utc - qt).total_seconds() // 60)) if qt else None
         rows.append(obj)
+    session, early = market_session(now_utc)
+    trend_utc = local_to_utc(data.get("trend_as_of"), SOURCE_TIMEZONE)
+    flags = quality_flags(rows, session, now_utc, trend_utc)
     doc = {
+        "schema_version": SCHEMA_VERSION,
         "title": data["title"],
         "description": "Read-only mirror of a Google Sheet used to guide dollar-cost averaging. Market data only.",
         "source_last_updated": data["last_updated"],
         "source_last_updated_note": data["last_updated_note"],
+        "source_last_updated_utc": iso_utc(local_to_utc(data["last_updated"], SOURCE_TIMEZONE)),
+        "source_timezone": SOURCE_TIMEZONE,
         "mirrored_at_utc": mirrored_utc,
+        "market_timezone": MARKET_TIMEZONE,
+        "market_session": session,
+        "early_close_today": early,
+        "trend_as_of": data.get("trend_as_of"),
+        "trend_as_of_utc": iso_utc(trend_utc),
+        "data_quality": {
+            "status": "OK" if not flags else "CHECK",
+            "flag_count": len(flags),
+            "flags": flags,
+        },
         "source_csv_url": source_url,
         "units_note": data["units_note"],
         "conventions": {
@@ -247,6 +370,10 @@ def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str):
             "last_trade_time": "exchange local time (Cboe indexes in US Central)",
             "status": "OK, Stale (no trade in 4+ days) or Unavailable",
             "trend_changes": "change_5d and change_20d compare the current level with the close 5 and 20 trading days earlier: percent for prices, basis points for yields",
+            "quote_timestamp_utc": "last_trade_time converted to UTC (NYSE and Nasdaq rows from US Eastern, Cboe rows from US Central); null when the published data has no trade time",
+            "quote_age_min": "minutes between the trade time and mirrored_at_utc",
+            "market_session": "open, premarket, after_hours, closed, weekend or holiday (US Eastern, NYSE calendar)",
+            "data_quality": "flags list stale or unverifiable quotes, non-OK statuses, prices that do not reconcile, and stale trend copies; status OK means no flags",
             "decision_framework": "Section 5 rows hold text readings in the price field (for example HOLD or DEVELOPING); their notes explain the reasoning",
         },
         "columns": [{"key": k, "label": l} for l, k in zip(data["labels"], data["keys"])],
@@ -254,6 +381,7 @@ def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str):
         "rows": rows,
     }
     path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return doc
 
 
 def status_class(status: str) -> str:
@@ -276,13 +404,17 @@ def change_class(key: str, value: str) -> str:
     return ""
 
 
-def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, mirrored_local_text):
+def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, mirrored_local_text, doc=None):
     e = html.escape
     mirrored = mirrored_utc_text + (f" ({mirrored_local_text})" if mirrored_local_text else "")
     updated = data["last_updated"] or "unknown"
     if data["last_updated_note"]:
         updated += f" {data['last_updated_note']}"
 
+    dq = (doc or {}).get("data_quality", {})
+    quality_text = "OK" if dq.get("status") == "OK" else f"{dq.get('flag_count', 0)} item(s) to check"
+    flag_items = "".join(f"<li>{e((f.get('ticker') or 'General') + ': ' + f['issue'])}</li>" for f in dq.get("flags", []))
+    flag_list = f'\n<ul class="flags">{flag_items}</ul>' if flag_items else ""
     head_cells = "".join(f'<th scope="col">{e(l)}</th>' for l in data["labels"])
 
     # Group records by section, keeping order.
@@ -354,6 +486,7 @@ def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, 
   td.status.ok {{ color: #1e8449; }}
   td.status.stale {{ color: #b9770e; }}
   td.status.unavailable {{ color: #c0392b; }}
+  ul.flags {{ margin: 4px 0 8px; color: #b9770e; }}
 </style>
 </head>
 <body>
@@ -361,7 +494,10 @@ def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, 
 <dl class="meta">
   <dt>Sheet last updated:</dt><dd>{e(updated)}</dd>
   <dt>Mirrored:</dt><dd>{e(mirrored)}</dd>
-</dl>
+  <dt>Trend values copied:</dt><dd>{e((data.get('trend_as_of') or 'unknown') + ' (sheet time zone)')}</dd>
+  <dt>Market session:</dt><dd>{e((doc or {}).get('market_session', 'unknown'))}</dd>
+  <dt>Data quality:</dt><dd>{e(quality_text)}</dd>
+</dl>{flag_list}
 <p class="units">{e(data['units_note'] or '')}</p>
 <p class="links">
   <a href="dashboard.csv">Clean CSV</a>
@@ -398,12 +534,14 @@ Mirrored at (UTC): {mirrored_utc}
 Files:
 - index.html: HTML table, grouped by section
 - dashboard.csv: one header row, one row per ticker, first column is Section
-- dashboard.json: same data, numbers as numbers, n/a as null, with units conventions
+- dashboard.json: same data, numbers as numbers, n/a as null, with units
+  conventions, quote timestamps in UTC, market session and data-quality flags
+  (schema version {SCHEMA_VERSION})
+- source.csv: the CSV exactly as Google published it
 
 Section 5 (Decision framework) gives the market opportunity, deployment
 recommendation and proposed tranche, with reasons in the notes. Section 6 adds
 trend context. The 5-day and 20-day change columns show direction.
-- source.csv: the CSV exactly as Google published it
 
 Rows: {tickers}
 
@@ -419,6 +557,7 @@ def main():
     ap.add_argument("--url", help="Published CSV link of the Dashboard tab")
     ap.add_argument("--input", help="Read a local CSV file instead of downloading (for testing)")
     ap.add_argument("--out", default="site", help="Output folder (default: site)")
+    ap.add_argument("--now", help="Pretend the current time is this UTC time, e.g. 2026-11-24T19:00:00Z (for testing)")
     args = ap.parse_args()
     if not args.url and not args.input:
         ap.error("give --url or --input")
@@ -429,16 +568,19 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     source_url = args.url or "(local file)"
-    mirrored_iso, mirrored_utc_text, mirrored_local_text = mirror_times()
+    now = (datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now
+           else datetime.now(timezone.utc)).replace(microsecond=0)
+    mirrored_iso, mirrored_utc_text, mirrored_local_text = mirror_times(now)
 
     (out / "source.csv").write_text(text, encoding="utf-8")
     write_clean_csv(data, out / "dashboard.csv")
-    write_json(data, out / "dashboard.json", source_url, mirrored_iso)
-    write_html(data, out / "index.html", source_url, mirrored_utc_text, mirrored_local_text)
+    doc = write_json(data, out / "dashboard.json", source_url, mirrored_iso, now)
+    write_html(data, out / "index.html", source_url, mirrored_utc_text, mirrored_local_text, doc)
     write_llms_txt(data, out / "llms.txt", mirrored_iso)
 
     print(f"OK: {len(data['records'])} rows in {len(data['sections'])} sections, "
-          f"sheet updated {data['last_updated']}, written to {out}/")
+          f"sheet updated {data['last_updated']}, market {doc['market_session']}, "
+          f"data quality {doc['data_quality']['status']} ({doc['data_quality']['flag_count']} flags), written to {out}/")
 
 
 if __name__ == "__main__":
