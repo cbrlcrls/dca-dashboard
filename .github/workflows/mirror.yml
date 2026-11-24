@@ -1,0 +1,79 @@
+
+name: Mirror DCA dashboard
+
+on:
+  schedule:
+    # Every 15 minutes on weekdays, 13:00 to 21:59 UTC.
+    # That covers US market hours (9:30 am to 4 pm Eastern) in both winter and summer time.
+    # Odd minutes (7, 22, 37, 52) avoid the busy top of the hour, so runs are less likely to be delayed.
+    - cron: "7,22,37,52 13-21 * * 1-5"
+    # One evening run on weekdays to capture closing values (2:17 pm or 3:17 pm Pacific).
+    - cron: "17 23 * * 1-5"
+  # Lets you run it by hand from the Actions tab.
+  workflow_dispatch:
+  # Re-publishes right away when you change the script or this file.
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/mirror.yml"
+
+permissions:
+  contents: read
+
+# Never run two publishes at the same time.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Published CSV link of the "Dashboard" tab. It is already public, so it is fine to keep here.
+  SHEET_CSV_URL: "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqJnJvCxe0S-6ZLt2tniRs4Mw8VfwNq4UnMZjfL_gV_flOs7RopEBa5esVvAYmfUf4R8i2-O5raqAk/pub?gid=1681366233&single=true&output=csv"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v7
+
+      - name: Download the Sheet and build the mirror files
+        run: python3 scripts/mirror.py --url "$SHEET_CSV_URL" --out site
+
+      - name: Set up GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Package the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  # GitHub pauses scheduled workflows in public repos after 60 days with no repository activity.
+  # This re-enables the workflow once each weekday evening so the schedule keeps running.
+  keepalive:
+    if: github.event_name == 'schedule' && github.event.schedule == '17 23 * * 1-5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the schedule active
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/mirror.yml/enable"
