@@ -11,11 +11,11 @@ Replace `cbrlcrls` with the GitHub username.
 
 | What | Link |
 |---|---|
-| HTML table | `https://USERNAME.github.io/dca-dashboard/` |
-| Clean CSV (one header row, one row per ticker, plus a Section column) | `https://USERNAME.github.io/dca-dashboard/dashboard.csv` |
-| JSON (numbers as numbers, `n/a` as null) | `https://USERNAME.github.io/dca-dashboard/dashboard.json` |
-| CSV exactly as Google published it | `https://USERNAME.github.io/dca-dashboard/source.csv` |
-| Short guide for AI readers | `https://USERNAME.github.io/dca-dashboard/llms.txt` |
+| HTML table | `https://cbrlcrls.github.io/dca-dashboard/` |
+| Clean CSV (one header row, one row per ticker, plus a Section column) | `https://cbrlcrls.github.io/dca-dashboard/dashboard.csv` |
+| JSON (numbers as numbers, `n/a` as null) | `https://cbrlcrls.github.io/dca-dashboard/dashboard.json` |
+| CSV exactly as Google published it | `https://cbrlcrls.github.io/dca-dashboard/source.csv` |
+| Short guide for AI readers | `https://cbrlcrls.github.io/dca-dashboard/llms.txt` |
 
 Every file shows two times: when the Sheet last recalculated, and when this mirror
 last copied it. If they're far apart, the mirror is behind.
