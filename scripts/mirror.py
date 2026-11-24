@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Mirror the DCA Decision Dashboard (published Google Sheet CSV) into static files
@@ -39,7 +40,9 @@ try:
 except Exception:  # tz database missing; fall back to UTC only
     PACIFIC = None
 
-# The 16 columns (A-P) of the Dashboard tab, in order, with JSON key names.
+# The columns of the Dashboard tab, in order, with JSON key names.
+# The first 16 (A-P) are required. Columns after that are optional and are
+# mirrored when present, so new columns can be added to the Sheet at the end.
 # If you rename or add a column in the Sheet, update this list to match.
 COLUMNS = [
     ("Ticker", "ticker"),
@@ -58,7 +61,10 @@ COLUMNS = [
     ("Data delay (min)", "data_delay_min"),
     ("Status", "status"),
     ("Notes", "notes"),
+    ("5-day change", "change_5d"),
+    ("20-day change", "change_20d"),
 ]
+REQUIRED_COLUMNS = 16
 LABELS = [label for label, _ in COLUMNS]
 KEYS = [key for _, key in COLUMNS]
 
@@ -66,6 +72,7 @@ KEYS = [key for _, key in COLUMNS]
 NUMERIC_KEYS = {
     "price", "previous_close", "day_change", "day_change_pct", "day_change_bps",
     "intraday_high", "intraday_low", "high_52w", "pct_below_52w_high", "data_delay_min",
+    "change_5d", "change_20d",
 }
 RIGHT_ALIGN_KEYS = NUMERIC_KEYS
 
@@ -151,10 +158,11 @@ def parse(text: str) -> dict:
     header = [c.strip() for c in rows[header_index]]
     while header and not header[-1]:
         header.pop()
-    if [norm(h) for h in header] != [norm(l) for l in LABELS]:
+    n = len(header)
+    if not (REQUIRED_COLUMNS <= n <= len(LABELS)) or [norm(h) for h in header] != [norm(l) for l in LABELS[:n]]:
         raise SystemExit(
             "Column headers do not match what the mirror expects, so nothing was published.\n"
-            f"  Expected: {LABELS}\n  Found:    {header}\n"
+            f"  Expected: {LABELS[:max(n, REQUIRED_COLUMNS)]}\n  Found:    {header}\n"
             "If you changed columns in the Sheet on purpose, update COLUMNS in scripts/mirror.py."
         )
 
@@ -170,9 +178,9 @@ def parse(text: str) -> dict:
             current_section = cells[0]                 # section label row
             sections.append(current_section)
             continue
-        if len(cells) > len(LABELS):
+        if len(cells) > n:
             raise SystemExit(f"Row has more columns than expected: {cells}. Not publishing.")
-        cells += [""] * (len(LABELS) - len(cells))
+        cells += [""] * (n - len(cells))
         records.append({"section": current_section, "cells": cells})
 
     if len(records) < MIN_DATA_ROWS:
@@ -189,6 +197,8 @@ def parse(text: str) -> dict:
         "units_note": units_note,
         "sections": sections,
         "records": records,
+        "labels": LABELS[:n],
+        "keys": KEYS[:n],
     }
 
 
@@ -209,7 +219,7 @@ def mirror_times():
 def write_clean_csv(data: dict, path: Path):
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(["Section"] + LABELS)
+    w.writerow(["Section"] + data["labels"])
     for r in data["records"]:
         w.writerow([r["section"] or ""] + r["cells"])
     path.write_text(buf.getvalue(), encoding="utf-8")
@@ -219,7 +229,7 @@ def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str):
     rows = []
     for r in data["records"]:
         obj = {"section": r["section"]}
-        for key, value in zip(KEYS, r["cells"]):
+        for key, value in zip(data["keys"], r["cells"]):
             obj[key] = to_json_value(key, value)
         rows.append(obj)
     doc = {
@@ -236,8 +246,10 @@ def write_json(data: dict, path: Path, source_url: str, mirrored_utc: str):
             "yields": "US2Y, US10Y and spread levels and day_change are in percentage points; day_change_bps is basis points",
             "last_trade_time": "exchange local time (Cboe indexes in US Central)",
             "status": "OK, Stale (no trade in 4+ days) or Unavailable",
+            "trend_changes": "change_5d and change_20d compare the current level with the close 5 and 20 trading days earlier: percent for prices, basis points for yields",
+            "decision_framework": "Section 5 rows hold text readings in the price field (for example HOLD or DEVELOPING); their notes explain the reasoning",
         },
-        "columns": [{"key": k, "label": l} for l, k in COLUMNS],
+        "columns": [{"key": k, "label": l} for l, k in zip(data["labels"], data["keys"])],
         "sections": data["sections"],
         "rows": rows,
     }
@@ -256,7 +268,7 @@ def status_class(status: str) -> str:
 
 
 def change_class(key: str, value: str) -> str:
-    if key not in {"day_change", "day_change_pct", "day_change_bps"}:
+    if key not in {"day_change", "day_change_pct", "day_change_bps", "change_5d", "change_20d"}:
         return ""
     n = to_number(value)
     if isinstance(n, (int, float)):
@@ -271,7 +283,7 @@ def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, 
     if data["last_updated_note"]:
         updated += f" {data['last_updated_note']}"
 
-    head_cells = "".join(f'<th scope="col">{e(l)}</th>' for l in LABELS)
+    head_cells = "".join(f'<th scope="col">{e(l)}</th>' for l in data["labels"])
 
     # Group records by section, keeping order.
     groups = []
@@ -284,10 +296,10 @@ def write_html(data: dict, path: Path, source_url: str, mirrored_utc_text: str, 
     for section, recs in groups:
         lines = ["<tbody>"]
         if section:
-            lines.append(f'<tr class="section"><th colspan="{len(LABELS)}" scope="colgroup">{e(section)}</th></tr>')
+            lines.append(f'<tr class="section"><th colspan="{len(data['labels'])}" scope="colgroup">{e(section)}</th></tr>')
         for r in recs:
             tds = []
-            for i, (key, value) in enumerate(zip(KEYS, r["cells"])):
+            for i, (key, value) in enumerate(zip(data["keys"], r["cells"])):
                 classes = []
                 if key in RIGHT_ALIGN_KEYS and not isinstance(to_number(value), str):
                     classes.append("num")
@@ -387,6 +399,10 @@ Files:
 - index.html: HTML table, grouped by section
 - dashboard.csv: one header row, one row per ticker, first column is Section
 - dashboard.json: same data, numbers as numbers, n/a as null, with units conventions
+
+Section 5 (Decision framework) gives the market opportunity, deployment
+recommendation and proposed tranche, with reasons in the notes. Section 6 adds
+trend context. The 5-day and 20-day change columns show direction.
 - source.csv: the CSV exactly as Google published it
 
 Rows: {tickers}
