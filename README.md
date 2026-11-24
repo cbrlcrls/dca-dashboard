@@ -7,7 +7,7 @@ holdings or account values.
 
 ## Where to read it
 
-Replace `USERNAME` with the GitHub username.
+Replace `cbrlcrls` with the GitHub username.
 
 | What | Link |
 |---|---|
